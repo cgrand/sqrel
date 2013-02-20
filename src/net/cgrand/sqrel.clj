@@ -49,14 +49,30 @@
 (defn maybe [])
 (defn many [])
 
+(defprotocol Rel
+  (spec [r]))
+
+(defn rel? [x]
+  (satisfies? Rel x))
+
+(defn- col-spec [x]
+  (when-let [[t v] (and (rel? x) (:expr (spec x)))]
+    (when (= t :val) v)))
+
+(defn- complain [& xs]
+  (throw (RuntimeException. (apply str xs))))
+
 (defn- -restrict [m x]
   (let [{tbls :table-aliases cols :cols} m
+        explicit-col (fn [x] (or (get cols x)
+                               (when-let [[tbl :as cs] (col-spec x)]
+                                 (if (tbls tbl) 
+                                   cs
+                                   (complain "Column not present in rel: " cs)))))
         cols (if (next tbls)
-               (fn [k] (or (get cols k) 
-                         (throw (RuntimeException. (str "Can't map alias " k)))))
+               #(or (explicit-col %) (complain "Can't map alias " %))
                (let [tbl (first (keys tbls))]
-                 (fn [k]
-                   (or (get cols k) [tbl (name k)]))))
+                 #(or (explicit-col %) [tbl (name %)])))
         aliases (into {} 
                   (for [[k v] (cond
                                 (map? x) x
@@ -71,12 +87,6 @@
     (assoc m
       :cols aliases
       :expr expr)))
-
-(defprotocol Rel
-  (spec [r]))
-
-(defn rel? [x]
-  (satisfies? Rel x))
 
 (deftype SQLRel [m]
   Rel
