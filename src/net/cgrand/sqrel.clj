@@ -1,4 +1,5 @@
 (ns net.cgrand.sqrel
+  "The SQL library that won't drive you nuts."
   (:require [clojure.java.jdbc :as sql])
   (:require [clojure.string :as str]))
 
@@ -74,6 +75,9 @@
 (defprotocol Rel
   (spec [r]))
 
+(defn rel? [x]
+  (satisfies? Rel x))
+
 (deftype SQLRel [m]
   Rel
   (spec [r] m)
@@ -140,13 +144,42 @@
   {:eq (reduce #(merge-constraint :eq %1 %2) #{}
          (map (fn [[k va]] #{(pair va (get b k))}) a))})
 
+(defn- spec-expr [x]
+  (cond
+    (rel? x) (spec x)
+    (map? x) {:expr [:map x]}
+    (vector? x) {:expr [:vector x]}
+    :else {:expr [:val x]}))
+
 (defn eq [& rs]
   (apply rel 
-    (let [rs (map spec rs)] 
+    (let [rs (map spec-expr rs)] 
       (SQLRel. 
         {:constraints 
          (reduce merge-constraints 
            (map #(eq-constraints (:expr (first rs)) (:expr %)) (next rs)))}))
+    (filter rel? rs)))
+
+(defmulti join-constraints (fn [[ta a] [tb b]] [ta tb]))
+
+(defmethod join-constraints [:map :map] [[ta a] [tb b]]
+  {:eq (reduce #(merge-constraint :eq %1 %2) #{}
+         (for [[k va] a :when (contains? b k)] 
+           #{(pair va (get b k))}))})
+
+(defmethod join-constraints :default [a b]
+  (eq-constraints a b))
+
+(defn join [& rs]
+  (apply rel 
+    (let [rs (map spec rs)] 
+      (SQLRel. 
+        {:constraints 
+         (reduce merge-constraints
+           (for [[a & bs :as rs] (iterate next rs)
+                 :while bs
+                 b bs]
+             (join-constraints (:expr a) (:expr b))))}))
     rs))
 
 (defmethod merge-constraint :eq [tag partition-a partition-b]
