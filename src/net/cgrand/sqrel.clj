@@ -144,7 +144,7 @@
 
 (defmethod eq-constraints [:vector :vector] [[ta a] [tb b]]
   (when-not (= (count a) (count b))
-    (throw (RuntimeException. "Can't compare")))
+    (complain "Can't compare"))
   {:eq (reduce #(merge-constraint :eq %1 %2) #{} 
          (map (fn [a b] #{(pair a b)}) a b))})
 
