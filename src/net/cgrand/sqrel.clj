@@ -3,49 +3,6 @@
   (:require [clojure.java.jdbc :as sql])
   (:require [clojure.string :as str]))
 
-#_((def db {:classname "org.h2.Driver"
-         :subprotocol "h2"
-         :subname "mem:test;DB_CLOSE_DELAY=-1"})
-
-(sql/with-connection db
-  (sql/create-table :employee
-    [:id "INT"]
-    [:name "VARCHAR"]
-    [:dept_id "INT"])
-  (sql/create-table :dept
-    [:id "INT"]
-    [:name "VARCHAR"])
-  (sql/insert-values :employee [:id :name :dept_id]
-    [1 "John Doe" 1]
-    [2 "Jane Doe" 1]
-    [3 "Homer Simpson" 2])
-  (sql/insert-values :dept [:id :name]
-    [1 "Sales"]
-    [2 "Maintenance"]))
-
-(table "employee")
-{:table-aliases {"employee" "employee"}}
-"SELECT * FROM employee employee"
-
-
-(:id (table "employee"))
-{:table-aliases {"employee" "employee"}
- :cols {:id ["employee" "id"]}
- :expr [identity :id] ; or :expr [identity ["employee" "id"]]
- }
-"SELECT employee.id FROM employee employee"
-
-(eq (:dept_id (table "employee")) (:id (table "dept")))
-{:table-aliases {"employee" "employee" "dept" "dept"}
- :constraints #{[:eq ["employee" "dept_id"] ["dept" "id"]]}
- }
-"SELECT * FROM employee employee, dept dept WHERE dept.id = employee.dept_id"
-
-); a rel has an expression
-
-(defn restrict []
-  )
-
 (defn maybe [])
 (defn many [])
 
@@ -63,16 +20,19 @@
   (throw (RuntimeException. (apply str xs))))
 
 (defn- -restrict [m x]
-  (let [{tbls :table-aliases cols :cols} m
+  (let [{tbls :table-aliases cols :cols col-name :col-name-fn} m
         explicit-col (fn [x] (or (get cols x)
                                (when-let [[tbl :as cs] (col-spec x)]
                                  (if (tbls tbl) 
                                    cs
                                    (complain "Column not present in rel: " cs)))))
-        cols (if (next tbls)
-               #(or (explicit-col %) (complain "Can't map alias " %))
-               (let [tbl (first (keys tbls))]
-                 #(or (explicit-col %) [tbl (name %)])))
+        cols (if col-name
+               #(or (explicit-col %) 
+                  (let [tbl (first (keys tbls))
+                        col (or (col-name %)
+                              (complain (format "No column found for %s in table %s." % tbl)))]
+                    [tbl col]))
+               #(or (explicit-col %) (complain "Can't map alias " %)))
         aliases (into {} 
                   (for [[k v] (cond
                                 (map? x) x
@@ -81,38 +41,44 @@
                     [k (cols v)]))
         expr (cond
                (map? x) [:map (zipmap (keys x) (map cols (vals x)))]
-               (set? x) [:map x (zipmap x (map cols x))] 
+               (set? x) [:map (zipmap x (map cols x))] 
                (vector? x) [:vector (vec (map cols x))]
                (keyword? x) [:val (cols x)])]
     (assoc m
       :cols aliases
       :expr expr)))
 
-(deftype SQLRel [m]
+(deftype SQRel [m]
   Rel
   (spec [r] m)
   clojure.lang.ILookup
   (valAt [r k]
-    (SQLRel. (-restrict m k)))
+    (SQRel. (-restrict m k)))
   clojure.lang.IFn
   (invoke [this x]
-    (SQLRel. (-restrict m x)))
+    (SQRel. (-restrict m x)))
   Object
-  (toString [r]
-    (pr-str (str "#" (class r) [m]))))
+  (equals [this that]
+    (= (spec this) (spec that)))
+  (hashCode [this]
+    (bit-xor 36rSQREL (hash m))))
 
-(defmethod print-method SQLRel [r w]
-  (.write w  (str "#" (.getName ^Class (class r)) "["))
-  (print-method (spec r) w)
-  (.write w  "]"))
+(defn sqlified-name [x]
+  (if (or (keyword? x) (symbol? x))
+    (str/replace (name x) \- \_)
+    x))
 
-(defmethod print-dup SQLRel [r ^java.io.Writer w]
-  (.write w  (str "#" (.getName ^Class (class r)) "["))
-  (print-dup (spec r) w)
-  (.write w  "]"))
+(defn cols-fn [cols]
+  (if (or (set? cols) (sequential? cols))
+    (comp sqlified-name (set cols))
+    (or cols sqlified-name)))
 
-(defn table [tblname]
-  (SQLRel. {:table-aliases {tblname tblname}}))
+(defn some-cols [& more-cols]
+  (apply some-fn (map cols-fn more-cols)))
+
+(defn table [tblname & {alias :as cols :cols}]
+  (SQRel. {:table-aliases {(or alias tblname) tblname}
+            :col-name-fn (cols-fn cols)}))
 
 (defmulti merge-constraint (fn [tag a b] tag))
 
@@ -130,7 +96,7 @@
 
 (defn rel [& rs]
   (let [rs (map spec rs)]
-    (SQLRel. {:table-aliases (reduce into {} (map :table-aliases rs))
+    (SQRel. {:table-aliases (reduce into {} (map :table-aliases rs))
               :constraints (reduce merge-constraints {} 
                              (map :constraints rs))})))
 
@@ -164,7 +130,7 @@
 (defn eq [& rs]
   (apply rel 
     (let [rs (map spec-expr rs)] 
-      (SQLRel. 
+      (SQRel. 
         {:constraints 
          (reduce merge-constraints 
            (map #(eq-constraints (:expr (first rs)) (:expr %)) (next rs)))}))
@@ -183,8 +149,8 @@
 (defn join [& rs]
   (apply rel 
     (let [rs (map spec rs)] 
-      (SQLRel. 
-        {:constraints 
+      (SQRel. 
+        {:constraints ; it's heavy handed n^2 instead of n
          (reduce merge-constraints
            (for [[a & bs :as rs] (iterate next rs)
                  :while bs
@@ -211,17 +177,63 @@
                           (str (expr-sql x) "=" (expr-sql y))))]
     (str/join " AND " exprs)))
 
-(defn sql [r]
-  (let [r (spec r)
-        cols (if-let [cols (seq (vals (:cols r)))]
-               (str/join ", " (map expr-sql cols))
-               "*")
+(defn sql-from [rel]
+  (let [r (spec rel)
         tables (str/join ", " (for [[alias table] (:table-aliases r)] 
                                 (str table " " alias)))
         where-exprs (keep (fn [[tag x]] (constraint-to-sql tag x))
                       (:constraints r))
-        sql (str "SELECT " cols " FROM " tables)
         sql (if (seq where-exprs) 
-              (str sql " WHERE " (str/join " AND " where-exprs))
-              sql)]
+              (str tables " WHERE " (str/join " AND " where-exprs))
+              tables)]
     sql))
+
+(defn sql [rel]
+  (let [r (spec rel)
+        cols (if-let [cols (seq (vals (:cols r)))]
+               (str/join ", " (map expr-sql cols))
+               "*")]
+    (str "SELECT " cols " FROM " (sql-from rel))))
+
+(defmethod print-method SQRel [r ^java.io.Writer w]
+  (.write w  "#<SQRel ")
+  (if (and (= :val (-> r spec :expr first))
+        (-> r spec :constraints nil?))
+    (print-method (-> r spec :expr second expr-sql) w)
+    (do
+      (print-method (-> r spec :expr) w)
+      (.write w  ", ")
+      (print-method (sql-from r) w)))
+  (.write w  ">"))
+
+(defmulti eval-expr (fn [tag v col-pos] tag))
+
+(defmethod eval-expr :val [tag x col-pos]
+  (fn [^java.sql.ResultSet rs] 
+    (if-let [i (col-pos x)] (.getObject rs (int i)) x)))
+
+(defmethod eval-expr :vector [tag v col-pos]
+  (fn [^java.sql.ResultSet rs] 
+    (mapv #(if-let [i (col-pos %)] (.getObject rs (int i)) %) v)))
+
+(defmethod eval-expr :map [tag m col-pos]
+  (fn [^java.sql.ResultSet rs] 
+    (reduce-kv #(if-let [i (col-pos %3)]
+                  (assoc %1 %2 (.getObject rs (int i)))
+                  %1) m m)))
+
+(defn- map-rs [f ^java.sql.ResultSet rs]
+  (lazy-seq
+    (when (.next rs)
+      (cons (f rs) (map-rs f rs)))))
+
+(defn select
+  ([r]
+    (let [{cols :cols [type v] :expr} (spec r)
+          col-pos (into {} (map-indexed (fn [i x] [x (inc i)]) (vals cols)))
+          f (eval-expr type v col-pos)]
+      (doall (map-rs f (-> (sql/connection) (.prepareStatement (sql r)) .executeQuery)))))
+  ([expr r]
+    (select (r expr)))
+  ([expr r & rs]
+    (select ((apply rel r rs) expr))))
