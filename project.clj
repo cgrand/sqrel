@@ -5,4 +5,5 @@
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :dependencies [[org.clojure/clojure "1.4.0"]
                  [com.h2database/h2 "1.3.170"]
-                 [org.clojure/java.jdbc "0.2.3"]])
+                 [org.clojure/java.jdbc "0.2.3"]
+                 [net.cgrand/replay "0.1.1"]])
