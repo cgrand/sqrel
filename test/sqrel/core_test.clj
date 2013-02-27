@@ -7,7 +7,7 @@
 (defmacro with-tmp-db [& body]
   `(sql/with-connection {:classname "org.h2.Driver"
                          :subprotocol "h2"
-                         :subname "mem:foo"}
+                         :subname "mem:"}
      ~@body))
 
 (defn setup []
@@ -93,4 +93,71 @@
 ^:eg => (sql (project {:dept (:name dept) 
                   :employees (many (:name employee))}
           (eq (:dept-id employee) (:id dept))))
-"SELECT dept.name, employee.name FROM dept dept, employee employee WHERE employee.dept_id=dept.id ORDER BY dept.name")
+"SELECT dept.name, employee.name FROM dept dept, employee employee WHERE employee.dept_id=dept.id ORDER BY dept.name"
+
+;; aggregation with nested projected rel
+^:nd => (select {:dept (:name dept) 
+                 :employees (many (employee [:name :id]))}
+          (eq (:dept-id employee) (:id dept)))
+({:dept "Maintenance", :employees #{["Homer Simpson" 3]}} 
+  {:dept "Sales", :employees #{["Jane Doe" 2] ["John Doe" 1]}})
+
+;; nested aggregations
+^:nd => (let [employee2 (table "employee" :as (gensym))
+              colleague-name (get (eq (:dept-id employee) (:dept-id employee2))
+                                (:name employee2))]
+          (select {:dept (:name dept) 
+                 :employees (many {:name (employee :name)
+                                   :colleagues (many colleague-name)})}
+          (eq (:dept-id employee) (:id dept))))
+({:dept "Maintenance", 
+  :employees #{{:name "Homer Simpson", :colleagues #{"Homer Simpson"}}}}
+ {:dept "Sales", 
+  :employees #{{:name "Jane Doe", :colleagues #{"John Doe" "Jane Doe"}}
+               {:name "John Doe", :colleagues #{"John Doe" "Jane Doe"}}}})
+
+; Let's try to remove the employee itslef fromhis/her colleagues set.
+; We can use the #'neq constraint:
+^:nd => (with-tmp-db
+          (setup)
+          (select (neq (:id employee) 2)))
+({:id 1, :name "John Doe", :dept_id 1} {:id 3, :name "Homer Simpson", :dept_id 2})
+
+; sqrel tries to simplify constraints:
+^:eg => (sql (rel (neq (:dept-id employee) 2 (:id dept))
+               (eq 2 (:id dept))))
+"SELECT * FROM employee employee, dept dept WHERE (2!=employee.dept_id) AND 2=dept.id"
+^:eg => (sql (rel (neq 2 (:id dept))
+               (eq 2 (:id dept))))
+"SELECT * FROM dept dept WHERE FALSE"
+
+; Removing the employee itself from the colleagues set turns out to be trickier.
+; Homer Simpson is removed because he doesn't have colleagues.
+^:nd => (let [{:keys [name id dept-id]} (table "employee" :as (gensym))
+              colleague-name (get (rel 
+                                    (eq (:dept-id employee) dept-id)
+                                    (neq (:id employee) id))
+                                name)]
+          (select {:dept (:name dept) 
+                   :employees (many {:name (employee :name)
+                                     :colleagues (many colleague-name)})}
+            (eq (:dept-id employee) (:id dept))))
+({:dept "Sales", 
+  :employees #{{:name "Jane Doe", :colleagues #{"John Doe"}}
+               {:name "John Doe", :colleagues #{"Jane Doe"}}}})
+
+; we need an outer join for this
+^:nd => (let [{:keys [name id dept-id]} (maybe (table "employee" :as (gensym)))
+              colleague-name (get (rel 
+                                    (eq (:dept-id employee) dept-id)
+                                    (neq (:id employee) id))
+                                name)]
+          (select {:dept (:name dept) 
+                   :employees (many {:name (employee :name)
+                                     :colleagues (many colleague-name)})}
+            (eq (:dept-id employee) (:id dept))))
+({:dept "Maintenance", 
+  :employees #{{:name "Homer Simpson", :colleagues #{}}}}
+ {:dept "Sales", 
+  :employees #{{:name "Jane Doe", :colleagues #{"John Doe"}}
+               {:name "John Doe", :colleagues #{"Jane Doe"}}}}))

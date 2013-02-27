@@ -3,8 +3,7 @@
   (:require [clojure.java.jdbc :as sql])
   (:require [clojure.string :as str]))
 
-(defn maybe [])
-(defn many [])
+(defn maybe [x] #_TODO x)
 
 (defprotocol Rel
   (spec [r]))
@@ -28,29 +27,78 @@
     (SQRel. (-restrict m x)))
   Object
   (equals [this that]
-    (= (spec this) (spec that)))
+    (and (rel? that) (= (spec this) (spec that))))
   (hashCode [this]
     (unchecked-int (bit-xor 36rSQREL (hash m)))))
 
-(defmulti merge-constraint (fn [tag a b] tag))
+(defmulti -refine-constraint (fn [[tag1] [tag2]] [tag1 tag2]))
+
+(defmethod -refine-constraint :default [c1 c2] [c1 c2])
+
+(defn refine-constraint [[tag1 :as c1] [tag2 :as c2]]
+  (if (or (nil? c2) (= :impossible tag2))
+    [c1 c2]
+    (-refine-constraint c1 c2)))
+
+(def ^:private impossible-constraint [:impossible])
+
+(defn- impossible? [cs]
+  (contains? cs impossible-constraint))
+
+(def ^:private impossible-constraints #{impossible-constraint})
 
 (defn merge-constraints
-  ([] {})
-  ([c] c)
-  ([ca cb]
-    (persistent!
-      (reduce (fn [c [k v]]
-                (assoc! c k (let [w (c k c)]
-                              (if (identical? w c)
-                                v
-                                (merge-constraint k (c k) v)))))
-        (transient ca) cb))))
+  ([] #{})
+  ([cs] cs)
+  ([csa csb]
+    (if (or (impossible? csa) (impossible? csb))
+      impossible-constraints
+      (let [csa (or csa #{})
+            csb (or csb #{})
+            [csa csb] 
+              (reduce 
+                (fn [[csa csb] cb]
+                  (let [[csa cb]
+                        (reduce 
+                          (fn [[csa cb :as x] ca]
+                            (let [[ca' cb] (refine-constraint ca cb)
+                                  csa (cond-let
+                                        (= ca' ca) csa 
+                                        :let [csa (disj csa ca)]
+                                        (nil? ca') csa
+                                        :else (conj csa ca'))]
+                              [csa cb])) 
+                          [csa cb] csa)]
+                    [csa (if cb (conj csb cb) csb)]))
+                [csa #{}] csb)
+              cs (into csa csb)]
+        (if (impossible? cs) impossible-constraints cs)))))
+
+(defmethod -refine-constraint [:eq :eq] [[_ eqsa :as ca] [_ eqsb :as cb]]
+  (if (some eqsa eqsb)
+    [nil [:eq (into eqsa eqsb)]]
+    [ca cb]))
+
+(defmethod -refine-constraint [:eq :neq] [[_ eqs :as ca] [_ neqs :as cb]]
+  (if-let [x (some eqs neqs)]
+    (let [neqs (reduce disj neqs (disj eqs x))]
+      [ca (if (next neqs) 
+            [:neq neqs]
+            [:impossible])])
+    [ca cb]))
+
+(defmethod -refine-constraint [:neq :eq] [[_ neqs :as ca] [_ eqs :as cb]]
+  (if-let [x (some eqs neqs)]
+    (let [neqs (reduce disj neqs (disj eqs x))]
+      (if (next neqs) 
+        [[:neq neqs] cb]
+        [ca [:impossible]]))
+    [ca cb]))
 
 (defn rel [& rs]
   (let [rs (map spec rs)]
     (SQRel. {:table-aliases (reduce into {} (map :table-aliases rs))
-              :constraints (reduce merge-constraints {} 
-                             (map :constraints rs))})))
+              :constraints (reduce merge-constraints (map :constraints rs))})))
 
 (defn- col-spec [x]
   (when-let [{col :col
@@ -73,6 +121,15 @@
               (assoc m k (f (m k init) x))))
     {} coll))
 
+(defmacro ^:private cond-let 
+  ([x] x)
+  ([t x & more]
+    (cond 
+      (= t :let) `(let ~x (cond-let ~@more))
+      (= t :else) x
+      (vector? t) `(if-let ~t ~x (cond-let ~@more))
+      :else `(if ~t ~x (cond-let ~@more)))))
+
 (defn- entries [x]
   (if (map? x) 
     (seq x)
@@ -91,12 +148,27 @@
 (defn many [x] (with-meta [x] {::many true}))
 (defn many? [x] (-> x meta ::many))
 
+(defn- nested-expr-rels [expr]
+  (-> expr (paths-to #(and (rel? %) (-> % spec :expr :expr)))
+    (dissoc nil false)))
+
+(defn- expand-expr [expr]
+  (let [expr+ps (nested-expr-rels expr)] 
+    {:expr (if (= (-> expr+ps vals first) #{()})
+             (-> expr+ps keys first)
+             (reduce-kv (fn [expr sub-expr ps]
+                          (reduce (fn [expr p] (assoc-in expr p sub-expr))
+                            expr ps)) 
+               expr expr+ps))
+     :rels (for [ps (vals expr+ps), p ps] (get-in expr p))}))
+
 ;; 1. find all path to rels BUT those that are below Many
 ;; 2. find all paths to Many instances
 (defn expr-spec
   ([expr] (expr-spec expr col-spec))
   ([expr cols-fn]
-    (let [{maniesp :many relsp :rel}
+    (let [{:keys [expr rels]} (expand-expr expr)
+          {maniesp :many relsp :rel}
           (paths-to expr #(cond 
                             (many? %) :many
                             (rel? %) :rel))
@@ -106,7 +178,8 @@
                               [p (expr-spec sub-expr cols-fn)])))]
       {:cols cols
        :manies manies
-       :expr expr})))
+       :expr expr
+       :rels rels})))
 
 (defn- -restrict [m x]
   (let [{tbls :table-aliases expr :expr col-name :col-name-fn} m
@@ -134,9 +207,9 @@
 (defn- expr-cols [{:keys [manies cols]}]
   (distinct (concat (vals cols) (mapcat expr-cols (vals manies)))))
 
-(defn- expr-rels [{:keys [manies cols expr]}]
-  (let [rels (map #(get-in expr %) (keys cols))]
-    (concat rels (mapcat expr-rels (vals manies)))))
+(defn- expr-rels [{:keys [manies cols expr rels]}]
+  (let [col-rels (map #(get-in expr %) (keys cols))]
+    (concat rels col-rels (mapcat expr-rels (vals manies)))))
 
 (defn expr-rel [x]
   (let [expr (expr-spec x)
@@ -161,10 +234,12 @@
   (SQRel. {:table-aliases {(or alias tblname) tblname}
             :col-name-fn (cols-fn cols)}))
 
-(defn- pair [a b] ; to circumvent the createWithCheck in < 1.5
-  (conj #{a} b))
+(defn- spec-expr [x]
+  (if (rel? x) 
+    (:expr (spec x))
+    {:expr x}))
 
-(defn- blank-expr 
+(defn- blank-expr
   ([expr cols]
     (reduce (fn [expr [p]] (if (seq p)
                              (assoc-in expr p nil)
@@ -178,24 +253,19 @@
     (or (seq ma) (seq ma))
       (throw (RuntimeException. "Can't compare aggregates"))
     (not= (blank-expr ea ca cb) (blank-expr eb ca cb))
-      {:eq #{#{0 1}}}
+      impossible-constraints
     :else
-    {:eq (reduce #(merge-constraint :eq %1 %2) #{}
-           (concat 
-             (for [[pa ta] ca
-                   :let [tb (get cb pa)]
-                   :when (and tb (not= ta tb))]
-               #{#{ta tb}})
-             (for [[c e] [[ca eb] [cb ea]]
-                   [p t] c
-                   :let [x (get-in e p)]
-                   :when (not (or (rel? x) (many? x)))]
-               #{#{t x}})))}))
-
-(defn- spec-expr [x]
-  (if (rel? x) 
-    (:expr (spec x))
-    {:expr x}))
+      (reduce merge-constraints
+        (concat 
+          (for [[pa ta] ca
+                :let [tb (get cb pa)]
+                :when (and tb (not= ta tb))]
+            #{[:eq #{ta tb}]})
+          (for [[c e] [[ca eb] [cb ea]]
+                [p t] c
+                :let [x (get-in e p)]
+                :when (not (or (rel? x) (many? x)))]
+            #{[:eq #{t x}]})))))
 
 (defn eq [& rs]
   (apply rel 
@@ -206,19 +276,48 @@
            (map #(eq-constraints (first rs) %) (next rs)))}))
     (filter rel? rs)))
 
+(defn- all-equal [coll]
+  (if (seq coll) 
+    (apply = coll)
+    true))
+
+(defn neq-constraints [& exprs]
+  (cond-let
+    (some (comp seq :manies) exprs)
+      (throw (RuntimeException. "Can't compare aggregates"))
+    :let [cols (mapcat :cols exprs)
+          blanks (map #(blank-expr (:expr %) cols) exprs)]
+    (not (all-equal blanks))
+      #{} ; if the blanks are not equals, there's no constraint
+    :else
+      (reduce merge-constraints
+        (for [[p cols] (reduce-by key (fn [s kv] (conj s (val kv))) #{} cols)
+              :let [vs (remove rel? (map #(get-in (:expr %) p) exprs))]
+              :when (all-equal vs)]
+          #{[:neq (if-let [[v] (seq vs)] (conj cols v) cols)]}))))
+
+(defn neq [& rs]
+  (apply rel 
+    (let [rs (map spec-expr rs)] 
+      (SQRel. 
+        {:constraints (apply neq-constraints rs)}))
+    (filter rel? rs)))
+
 (defmulti join-constraints (fn [[ta a] [tb b]] [ta tb]))
 
+;; outdated, not working
 (defmethod join-constraints [:map :map] [[ta a] [tb b]]
-  {:eq (reduce #(merge-constraint :eq %1 %2) #{}
-         (for [[k va] a :when (contains? b k)] 
-           #{(pair va (get b k))}))})
+  (reduce merge-constraints
+    (for [[k va] a :when (and (contains? b k)
+                           (not= va (get b k)))] 
+      #{[:eq #{va (get b k)}]})))
 
 (defmethod join-constraints :default [a b]
   (eq-constraints a b))
 
 (defn join [& rs]
   (apply rel 
-    (let [rs (map spec rs)] 
+    (let [rs (map spec-expr rs)] 
       (SQRel. 
         {:constraints ; it's heavy handed n^2 instead of n
          (reduce merge-constraints
@@ -228,13 +327,6 @@
              (join-constraints (:expr a) (:expr b))))}))
     rs))
 
-(defmethod merge-constraint :eq [tag partition-a partition-b]
-  (reduce (fn [partition xs] 
-            (let [ps (filter (fn [s] (some #(contains? s %) xs)) partition)]
-              (conj (reduce disj partition ps)
-                (reduce into xs ps)))) 
-    partition-a partition-b))
-
 (defmulti constraint-to-sql (fn [tag x] tag))
 
 (defn expr-sql [x]
@@ -242,10 +334,18 @@
     (str (nth x 0) \. (nth x 2))
     (str x)))
 
-(defmethod constraint-to-sql :eq [tag partition]
-  (when-let [exprs (seq (for [xs partition :let [x (first xs)] y (next xs)]
-                          (str (expr-sql x) "=" (expr-sql y))))]
-    (str/join " AND " exprs)))
+(defmethod constraint-to-sql :impossible [tag _]
+  "FALSE")
+
+(defmethod constraint-to-sql :eq [tag xs]
+  (let [[x & xs] (seq xs)] 
+    (str/join " AND " 
+      (for [y xs] (str (expr-sql x) "=" (expr-sql y))))))
+
+(defmethod constraint-to-sql :neq [tag xs]
+  (let [[x & xs] (seq xs)] 
+    (str "(" (str/join " OR " 
+               (for [y xs] (str (expr-sql x) "!=" (expr-sql y)))) ")")))
 
 (defn sql-from [rel]
   (let [r (spec rel)
@@ -265,11 +365,12 @@
 
 (defn ^String sql [rel]
   (let [r (spec rel)
-        cols (if-let [[alias _ col] (col-spec rel)]
-               (str alias \. col)
-               (if-let [cols (seq (expr-cols (:expr r)))]
+        cols (cond-let
+               [[alias _ col] (col-spec rel)]
+                 (str alias \. col)
+               [cols (seq (expr-cols (:expr r)))]
                  (str/join ", " (map expr-sql cols))
-                 "*")) ]
+               :else "*") ]
     (str "SELECT " cols " FROM " (sql-from rel)
       (sql-order-by rel))))
 
@@ -430,13 +531,21 @@
 (defn eval-expr [spec]
   (fill-fn spec))
 
+(defmacro ^:private =>
+  [x y]
+  `(or ~y (not ~x)))
+
 (defn- validate-rel-spec 
-  "Rudimentary invariants." 
+  "Some invariants." 
   [{:keys [expr] :as spec}]
   (and
-    (and (:col spec) (= 1 (count (:table-aliases))))
-    (and (:col-name-fn spec) (= 1 (count (:table-aliases))))
-    (every? (fn [[p _]] (many? (get-in expr p)))
-      (:manies (:expr spec)))
-    (every? (fn [[p _]] (rel? (get-in expr p)))
-      (:cols (:expr spec)))))
+    (=> expr 
+      (and 
+        (empty? (nested-expr-rels (:expr expr)))
+        (every? (fn [[p _]] (many? (get-in expr p)))
+          (:manies expr))
+        (every? (fn [[p _]] (rel? (get-in expr p)))
+          (:cols expr))))
+    (=> (:col spec) (nil? expr))
+    (=> (:col spec) (= 1 (count (:table-aliases))))
+    (=> (:col-name-fn spec) (= 1 (count (:table-aliases))))))
