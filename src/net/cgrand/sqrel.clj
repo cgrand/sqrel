@@ -3,6 +3,21 @@
   (:require [clojure.java.jdbc :as sql])
   (:require [clojure.string :as str]))
 
+(defn- reduce-by [k f init coll]
+  (reduce (fn [m x]
+            (let [k (k x)]
+              (assoc m k (f (m k init) x))))
+    {} coll))
+
+(defmacro ^:private cond-let 
+  ([x] x)
+  ([t x & more]
+    (cond 
+      (= t :let) `(let ~x (cond-let ~@more))
+      (= t :else) x
+      (vector? t) `(if-let ~t ~x (cond-let ~@more))
+      :else `(if ~t ~x (cond-let ~@more)))))
+
 (defn maybe [x] #_TODO x)
 
 (defprotocol Rel
@@ -114,21 +129,6 @@
 
 (defn- complain [& xs]
   (throw (RuntimeException. (apply str xs))))
-
-(defn- reduce-by [k f init coll]
-  (reduce (fn [m x]
-            (let [k (k x)]
-              (assoc m k (f (m k init) x))))
-    {} coll))
-
-(defmacro ^:private cond-let 
-  ([x] x)
-  ([t x & more]
-    (cond 
-      (= t :let) `(let ~x (cond-let ~@more))
-      (= t :else) x
-      (vector? t) `(if-let ~t ~x (cond-let ~@more))
-      :else `(if ~t ~x (cond-let ~@more)))))
 
 (defn- entries [x]
   (if (map? x) 

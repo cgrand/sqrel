@@ -1,10 +1,10 @@
 # sqrel
 
-A Clojure library designed to ... well, that part is up to you.
+The Clojure SQL library that won't drive you nuts.
 
 ## Usage
 
-FIXME
+Alpha subject to changes. See the tests http://github.com/cgrand/sqrel/blob/master/test/net/cgrand/sqrel/test.clj
 
 ## License
 

@@ -1,4 +1,4 @@
-(ns sqrel.core-test
+(ns net.cgrand.sqrel.test
   (:use clojure.test
     net.cgrand.sqrel
     [net.cgrand.replay :only [replay]])
