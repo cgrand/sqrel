@@ -9,7 +9,7 @@
               (assoc m k (f (m k init) x))))
     {} coll))
 
-(defmacro ^:private cond-let 
+(defmacro ^:private cond-let
   ([x] x)
   ([t x & more]
     (cond 
@@ -17,8 +17,6 @@
       (= t :else) x
       (vector? t) `(if-let ~t ~x (cond-let ~@more))
       :else `(if ~t ~x (cond-let ~@more)))))
-
-(defn maybe [x] #_TODO x)
 
 (defprotocol Rel
   (spec [r]))
@@ -113,7 +111,20 @@
 (defn rel [& rs]
   (let [rs (map spec rs)]
     (SQRel. {:table-aliases (reduce into {} (map :table-aliases rs))
-              :constraints (reduce merge-constraints (map :constraints rs))})))
+             :constraints (reduce merge-constraints (map :constraints rs))})))
+
+(defn maybe [r]
+  (let [r (spec r)]
+    (SQRel. (assoc r :maybe true))))
+
+(defn another [r]
+  ; TODO very crude, works only on tables
+  (let [s (spec r)
+        tbl (-> s :table-aliases vals first)]
+    (SQRel. (assoc s :table-aliases {(name (gensym tbl)) tbl}))))
+
+(def ^:private ground-ts "The ground pseudo table's table spec."
+  [::ground ::ground])
 
 (defn- col-spec [x]
   (when-let [{col :col
@@ -232,12 +243,12 @@
 
 (defn table [tblname & {alias :as cols :cols}]
   (SQRel. {:table-aliases {(or alias tblname) tblname}
-            :col-name-fn (cols-fn cols)}))
+           :col-name-fn (cols-fn cols)}))
 
-(defn- spec-expr [x]
+(defn- spec-any [x]
   (if (rel? x) 
-    (:expr (spec x))
-    {:expr x}))
+    (spec x)
+    {:expr {:expr x}}))
 
 (defn- blank-expr
   ([expr cols]
@@ -247,8 +258,19 @@
   ([expr cola colb]
     (-> expr (blank-expr cola) (blank-expr colb))))
 
-(defn eq-constraints [{ea :expr ma :manies ca :cols}
-                      {eb :expr mb :manies cb :cols}]
+(defn- table-spec [col-spec]
+  (let [[alias tbl col] col-spec]
+    [alias tbl]))
+
+(defn- add-mts
+  "Adds \"maybier than\" constraints to the constraints set cs."
+  [cs tsa a? tsb b?]
+  (let [cs (if a? cs (conj cs [:mt tsb tsa]))
+        cs (if b? cs (conj cs [:mt tsa tsb]))]
+    cs))
+
+(defn eq-constraints [{{ea :expr ma :manies ca :cols} :expr a? :maybe}
+                      {{eb :expr mb :manies cb :cols} :expr b? :maybe}]
   (cond
     (or (seq ma) (seq ma))
       (throw (RuntimeException. "Can't compare aggregates"))
@@ -257,19 +279,20 @@
     :else
       (reduce merge-constraints
         (concat 
-          (for [[pa ta] ca
-                :let [tb (get cb pa)]
-                :when (and tb (not= ta tb))]
-            #{[:eq #{ta tb}]})
-          (for [[c e] [[ca eb] [cb ea]]
-                [p t] c
+          (for [[pa csa] ca
+                :let [csb (get cb pa)]
+                :when (and csb (not= csa csb))]
+            (add-mts #{[:eq #{csa csb}]} (table-spec csa) a? (table-spec csb) b?))
+          (for [[c e c? e?] [[ca eb a? b?] [cb ea b? a?]]
+                :when (not e?) ; (eq x (maybe 2)) is always true
+                [p cs] c
                 :let [x (get-in e p)]
                 :when (not (or (rel? x) (many? x)))]
-            #{[:eq #{t x}]})))))
+            (add-mts #{[:eq #{cs x}]} (table-spec cs) c? ground-ts false))))))
 
 (defn eq [& rs]
   (apply rel 
-    (let [rs (map spec-expr rs)] 
+    (let [rs (map spec-any rs)] 
       (SQRel. 
         {:constraints 
          (reduce merge-constraints 
@@ -281,16 +304,26 @@
     (apply = coll)
     true))
 
-(defn neq-constraints [& exprs]
+(defn neq-constraints [& rels]
   (cond-let
+    :let [exprs (map :expr rels)
+          sure-exprs (map :expr (remove :maybe rels))]
     (some (comp seq :manies) exprs)
       (throw (RuntimeException. "Can't compare aggregates"))
     :let [cols (mapcat :cols exprs)
           blanks (map #(blank-expr (:expr %) cols) exprs)]
     (not (all-equal blanks))
       #{} ; if the blanks are not equals, there's no constraint
+    :let [ps (set (keys cols))
+          tss-of (fn [expr]
+                   (map #(if-let [c (get (:cols expr) %)]
+                           (table-spec c)
+                           ground-ts) ps))
+          sures (set (mapcat tss-of sure-exprs))
+          all (set (mapcat tss-of exprs))
+          mts (set (for [a all b all :when (and (not= a b) (sures b))] [:mt a b]))]
     :else
-      (reduce merge-constraints
+      (reduce merge-constraints mts
         (for [[p cols] (reduce-by key (fn [s kv] (conj s (val kv))) #{} cols)
               :let [vs (remove rel? (map #(get-in (:expr %) p) exprs))]
               :when (all-equal vs)]
@@ -298,13 +331,14 @@
 
 (defn neq [& rs]
   (apply rel 
-    (let [rs (map spec-expr rs)] 
+    (let [rs (map spec-any rs)] 
       (SQRel. 
         {:constraints (apply neq-constraints rs)}))
     (filter rel? rs)))
 
 (defmulti join-constraints (fn [[ta a] [tb b]] [ta tb]))
 
+#_(
 ;; outdated, not working
 (defmethod join-constraints [:map :map] [[ta a] [tb b]]
   (reduce merge-constraints
@@ -317,7 +351,7 @@
 
 (defn join [& rs]
   (apply rel 
-    (let [rs (map spec-expr rs)] 
+    (let [rs (map (comp :expr spec-any) rs)] 
       (SQRel. 
         {:constraints ; it's heavy handed n^2 instead of n
          (reduce merge-constraints
@@ -325,7 +359,9 @@
                  :while bs
                  b bs]
              (join-constraints (:expr a) (:expr b))))}))
-    rs))
+    rs)))
+
+(defmulti join-order (fn [tag x] tag))
 
 (defmulti constraint-to-sql (fn [tag x] tag))
 
@@ -337,6 +373,9 @@
 (defmethod constraint-to-sql :impossible [tag _]
   "FALSE")
 
+(defmethod constraint-to-sql :mt [tag _]
+  nil)
+
 (defmethod constraint-to-sql :eq [tag xs]
   (let [[x & xs] (seq xs)] 
     (str/join " AND " 
@@ -347,16 +386,14 @@
     (str "(" (str/join " OR " 
                (for [y xs] (str (expr-sql x) "!=" (expr-sql y)))) ")")))
 
+(defn- constraints-to-sql [cs]
+  (when-let [exprs (seq (keep (fn [[tag x]] (constraint-to-sql tag x)) cs))]
+    (str/join " AND " exprs)))
+
+(declare constraints-to-from-where-sql)
+
 (defn sql-from [rel]
-  (let [r (spec rel)
-        tables (str/join ", " (for [[alias table] (:table-aliases r)] 
-                                (str table " " alias)))
-        where-exprs (keep (fn [[tag x]] (constraint-to-sql tag x))
-                      (:constraints r))
-        sql (if (seq where-exprs) 
-              (str tables " WHERE " (str/join " AND " where-exprs))
-              tables)]
-    sql))
+  (-> rel spec :constraints constraints-to-from-where-sql))
 
 (defn sql-order-by [rel]
   (let [{:keys [manies cols]} (:expr (spec rel))]
@@ -549,3 +586,153 @@
     (=> (:col spec) (nil? expr))
     (=> (:col spec) (= 1 (count (:table-aliases))))
     (=> (:col-name-fn spec) (= 1 (count (:table-aliases))))))
+ 
+(defn- scc 
+  "Returns the strongly connected components of a graph specified by its nodes
+   and a successor function succs from node to nodes.
+   The used algorithm is Tarjan's one."
+  ([g]
+    (scc (keys g) g))
+  ([nodes succs]
+    (letfn [(sc [env node]
+              ; env is a map from nodes to stack length or nil, nil means the node is known to belong to another SCC
+              ; there are two special keys: ::stack for the current stack and ::sccs for the current set of SCCs
+              #_{:post [(contains? % node)]}
+              (if (contains? env node)
+                env
+                (let [stack (::stack env)
+                      n (count stack)
+                      env (assoc env node n ::stack (conj stack node))
+                      env (reduce (fn [env succ]
+                                    (let [env (sc env succ)]
+                                      (assoc env node (min (or (env succ) n) (env node)))))
+                            env (succs node))]
+                  (if (= n (env node)) ; no link below us in the stack, call it a SCC
+                    (let [nodes (::stack env)
+                          scc (set (take (- (count nodes) n) nodes))
+                          env (reduce #(assoc %1 %2 nil) env scc)] ; clear all stack lengths for these nodes since this SCC is done
+                      (assoc env ::stack stack ::sccs (conj (::sccs env) scc)))
+                    env))))]
+      (::sccs (reduce sc {::stack () ::sccs #{}} nodes)))))
+
+(defn- edges [nodes succs]
+  (for [node nodes, succ (succs node)]
+    [node succ]))
+
+(defn- graph-map 
+  "Takes a collection of edges [from to] and returns a map such that (get m x)
+   returns the successors of x."
+  [edges]
+  (reduce-by first #(conj %1 (second %2)) #{} edges))
+
+(defn- scc-graph
+  ([g] (scc-graph (keys g) g))
+  ([nodes succs]
+    (let [sccs (scc nodes succs)
+          scc-of (into {} (for [nodes sccs
+                                node nodes] [node nodes]))
+          empty-graph (zipmap sccs (repeat #{}))]
+      (->> (edges nodes succs)
+        (map #(map scc-of %))
+        (remove (fn [[x y]] (= x y)))
+        graph-map
+        (merge empty-graph)))))
+
+(defn- roots
+  ([g] (roots (keys g) g))
+  ([nodes succs]
+    (reduce disj (set nodes) (mapcat succs nodes))))
+
+#_(defn- rand-graph [n density]
+  (let [g (zipmap (range n) (repeat #{}))
+        m (Math/ceil (* n (dec n) density))]
+    (reduce (fn [g [x y]]
+              (update-in g [x] conj y))
+      g (take m (distinct (repeatedly (juxt #(rand-int n) #(rand-int n))))))))
+
+(defn- lmt-graph 
+  "Returns a graph as map of the
+    \"less maybe than\" relation."
+  [mts]
+  (graph-map (keep (fn [[tag mx y]] [y mx]) mts)))
+
+(defmulti split-applicable-constraint (fn [[tag] tss new-tss] tag))
+
+(defn- known-pred [tss]
+  (fn [x]
+    (if-let [[alias tbl col] (when (vector? x) x)]
+      (contains? tss [alias tbl])
+      true)))
+
+(defmethod split-applicable-constraint :eq [[tag xs :as c] tss new-tss]
+  (let [axs (filter (known-pred tss) xs)
+        naxs (reduce disj xs axs)
+        naxs (conj naxs (first (remove (known-pred new-tss) axs)))]
+    (if (next axs)
+      [[:eq axs] (when (next naxs) [:eq naxs])]
+      [nil c])))
+
+(defmethod split-applicable-constraint :neq [[tag xs :as c] tss new-tss]
+  (if (every? (known-pred tss) xs)
+    [c nil]
+    [nil c]))
+
+(defmethod split-applicable-constraint :impossible [c tss new-tss]
+  [c c])
+
+(defn- split-applicable-cs [cs tss new-tss]
+  (if (= tss new-tss)
+    [nil cs]
+    (let [scs (map #(split-applicable-constraint % tss new-tss) cs)]
+      [(keep first scs) (keep second scs)])))
+
+(defn- scc-joins
+  "Returns [cs joins] where cs is the remaining (not applied yet)
+   constraints, joins is a collection of [ts cs] where ts is a table-spec
+   and cs a collection of applicable constraints."
+  [table-specs cs]
+  (let [[cs joins _] (reduce (fn [[cs joins seen] ts]
+                               (let [seen (conj seen ts)
+                                     [acs nacs] (split-applicable-cs cs seen #{ts})]
+                                 [nacs (conj joins [ts acs]) seen])) 
+                       [cs [] #{}] (remove #{ground-ts} table-specs))]
+    [cs joins]))
+
+(defn- left-joins [r g cs]
+  (letfn [(walk [tss cs seen]
+            (let [[cs joins] (scc-joins tss cs)
+                  seen (into seen tss)
+                  [acs nacs] (split-applicable-cs cs seen tss)]
+              (reduce (fn [[cs ljoins] tss]
+                        (let [[cs ljs] (walk tss cs seen)]
+                          [cs (into ljoins ljs)]))
+                [nacs [[joins acs]]] (g tss))))]
+    (walk r cs #{})))
+
+(defn- scc-joins-sql [joins]
+  (str/join " JOIN "
+    (map (fn [[[alias tbl] cs]]
+           (str tbl " " alias (when-let [on (constraints-to-sql cs)]
+                                (str " ON " on))))
+      joins)))
+
+(defn- left-joins-sql [ljoins]
+  (str/join " LEFT JOIN "
+    (map (fn [[joins cs]]
+           (str "(" (scc-joins-sql joins) ")"
+             (when-let [on (constraints-to-sql cs)] (str " ON " on))))
+      ljoins)))
+
+(defn- constraints-to-from-where-sql [cs]
+  (let [{mts true cs false} (group-by #(= (first %) :mt) cs)
+        g (scc-graph (lmt-graph mts))
+        rs (roots g)
+        _ (when (next rs) (throw (Exception. "TODO")))
+        [cs ljoins] (left-joins (first rs) g cs)
+        from (left-joins-sql ljoins)
+        where (constraints-to-sql cs)]
+    (if where 
+      (str from " WHERE " where) ; not so fast
+      from)))
+
+
