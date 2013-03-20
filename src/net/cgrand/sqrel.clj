@@ -27,31 +27,22 @@
 (defn aggregated? [x]
   (boolean (seq (:manies (:expr (spec x))))))
 
-(declare -restrict)
+(declare -project)
 
 (deftype SQRel [m]
   Rel
   (spec [r] m)
   clojure.lang.ILookup
   (valAt [r k]
-    (SQRel. (-restrict m k)))
+    (SQRel. (-project m k)))
   clojure.lang.IFn
   (invoke [this x]
-    (SQRel. (-restrict m x)))
+    (SQRel. (-project m x)))
   Object
   (equals [this that]
     (and (rel? that) (= (spec this) (spec that))))
   (hashCode [this]
     (unchecked-int (bit-xor 36rSQREL (hash m)))))
-
-(defmulti -refine-constraint (fn [[tag1] [tag2]] [tag1 tag2]))
-
-(defmethod -refine-constraint :default [c1 c2] [c1 c2])
-
-(defn refine-constraint [[tag1 :as c1] [tag2 :as c2]]
-  (if (or (nil? c2) (= :impossible tag2))
-    [c1 c2]
-    (-refine-constraint c1 c2)))
 
 (def ^:private impossible-constraint [:impossible])
 
@@ -60,7 +51,17 @@
 
 (def ^:private impossible-constraints #{impossible-constraint})
 
-(defn merge-constraints
+; no constraint simplification for now
+#_((defmulti -refine-constraint (fn [[tag1] [tag2]] [tag1 tag2]))
+
+(defmethod -refine-constraint :default [c1 c2] [c1 c2])
+
+(defn refine-constraint [[tag1 :as c1] [tag2 :as c2]]
+  (if (or (nil? c2) (= :impossible tag2))
+    [c1 c2]
+    (-refine-constraint c1 c2)))
+
+(defn simplify-constraints
   ([] #{})
   ([cs] cs)
   ([csa csb]
@@ -106,12 +107,12 @@
       (if (next neqs) 
         [[:neq neqs] cb]
         [ca [:impossible]]))
-    [ca cb]))
+    [ca cb])))
 
 (defn rel [& rs]
   (let [rs (map spec rs)]
     (SQRel. {:table-aliases (reduce into {} (map :table-aliases rs))
-             :constraints (reduce merge-constraints (map :constraints rs))})))
+             :constraints (reduce into #{} (map :constraints rs))})))
 
 (defn maybe [r]
   (let [r (spec r)]
@@ -192,7 +193,7 @@
        :expr expr
        :rels rels})))
 
-(defn- -restrict [m x]
+(defn- -project [m x]
   (let [{tbls :table-aliases expr :expr col-name :col-name-fn} m
         explicit-col (fn [x] (or (get expr x)
                                (when-let [[tbl :as cs] (col-spec x)]
@@ -250,71 +251,18 @@
     (spec x)
     {:expr {:expr x}}))
 
-(defn- blank-expr
-  ([expr cols]
-    (reduce (fn [expr [p]] (if (seq p)
-                             (assoc-in expr p nil)
-                             nil)) expr cols))
-  ([expr cola colb]
-    (-> expr (blank-expr cola) (blank-expr colb))))
-
 (defn- table-spec [col-spec]
   (let [[alias tbl col] col-spec]
     [alias tbl]))
 
-(defn- add-mts
-  "Adds \"maybier than\" constraints to the constraints set cs."
-  [cs tsa a? tsb b?]
-  (let [cs (if a? cs (conj cs [:mt tsb tsa]))
-        cs (if b? cs (conj cs [:mt tsa tsb]))]
-    cs))
-
-(defn eq-constraints [{{ea :expr ma :manies ca :cols} :expr a? :maybe}
-                      {{eb :expr mb :manies cb :cols} :expr b? :maybe}]
-  (cond
-    (or (seq ma) (seq ma))
-      (throw (RuntimeException. "Can't compare aggregates"))
-    (not= (blank-expr ea ca cb) (blank-expr eb ca cb))
-      impossible-constraints
-    :else
-      (reduce merge-constraints
-        (concat 
-          (for [[pa csa] ca
-                :let [csb (get cb pa)]
-                :when (and csb (not= csa csb))]
-            (add-mts #{[:eq #{csa csb}]} (table-spec csa) a? (table-spec csb) b?))
-          (for [[c e c? e?] [[ca eb a? b?] [cb ea b? a?]]
-                :when (not e?) ; (eq x (maybe 2)) is always true
-                [p cs] c
-                :let [x (get-in e p)]
-                :when (not (or (rel? x) (many? x)))]
-            (add-mts #{[:eq #{cs x}]} (table-spec cs) c? ground-ts false))))))
-
-(defn eq [& rs]
-  (apply rel 
-    (let [rs (map spec-any rs)] 
-      (SQRel. 
-        {:constraints 
-         (reduce merge-constraints 
-           (map #(eq-constraints (first rs) %) (next rs)))}))
-    (filter rel? rs)))
-
-(defn- all-equal [coll]
-  (if (seq coll) 
-    (apply = coll)
-    true))
-
-(defn neq-constraints [& rels]
+(defn- commutative-constraints [tag rels]
   (cond-let
     :let [exprs (map :expr rels)
           sure-exprs (map :expr (remove :maybe rels))]
     (some (comp seq :manies) exprs)
       (throw (RuntimeException. "Can't compare aggregates"))
     :let [cols (mapcat :cols exprs)
-          blanks (map #(blank-expr (:expr %) cols) exprs)]
-    (not (all-equal blanks))
-      #{} ; if the blanks are not equals, there's no constraint
-    :let [ps (set (keys cols))
+          ps (set (keys cols))
           tss-of (fn [expr]
                    (map #(if-let [c (get (:cols expr) %)]
                            (table-spec c)
@@ -323,17 +271,22 @@
           all (set (mapcat tss-of exprs))
           mts (set (for [a all b all :when (and (not= a b) (sures b))] [:mt a b]))]
     :else
-      (reduce merge-constraints mts
+      (reduce into mts
         (for [[p cols] (reduce-by key (fn [s kv] (conj s (val kv))) #{} cols)
-              :let [vs (remove rel? (map #(get-in (:expr %) p) exprs))]
-              :when (all-equal vs)]
-          #{[:neq (if-let [[v] (seq vs)] (conj cols v) cols)]}))))
+              :let [vs (remove rel? (map #(get-in (:expr %) p) exprs))]]
+          #{[tag (into cols vs)]}))))
+
+(defn eq [& rs]
+  (apply rel 
+    (let [rs (map spec-any rs)] 
+      (SQRel. 
+        {:constraints (commutative-constraints :eq rs)}))
+    (filter rel? rs)))
 
 (defn neq [& rs]
   (apply rel 
     (let [rs (map spec-any rs)] 
-      (SQRel. 
-        {:constraints (apply neq-constraints rs)}))
+      (SQRel. {:constraints (commutative-constraints :neq rs)}))
     (filter rel? rs)))
 
 (defmulti join-constraints (fn [[ta a] [tb b]] [ta tb]))
@@ -423,7 +376,7 @@
 
 (declare fill-fn keyed-fill-fn merge-aggregate-fn unkey-aggregate-fn)
 
-(defn project [expr & rs]
+(defn collect [expr & rs]
   (let [r1 (expr-rel expr)
         r (apply rel r1 rs)]
     (SQRel. (assoc (spec r) :expr (:expr (spec r1))))))
@@ -456,9 +409,9 @@
   ([expr & rs]
     (let [r1 (expr-rel expr)
           r (apply rel r1 rs)]
-      (select (SQRel. (assoc (spec r) :expr (:expr (spec r1))))))))
+      (select (apply collect expr rs)))))
 
-;; filling ane aggregating
+;; filling and aggregating
 
 (defn- balance [n f & args] 
   (if (> (count args) n)
@@ -563,7 +516,10 @@
         (fn [data]
           [(fill-key () data) (fill-val data)])
         (fn [data]
-          {(fill-key () data) (fill-val data)})))))
+          (let [k (fill-key () data)]
+            (if (every?  nil? k) ; testing a single not-null column would be better
+              {}
+              {(fill-key () data) (fill-val data)})))))))
 
 (defn eval-expr [spec]
   (fill-fn spec))

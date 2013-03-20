@@ -61,7 +61,7 @@
                                          :dname (:name dept)}))
 "SELECT employee.name, dept.name FROM dept dept, employee employee WHERE 42=employee.dept_id AND 42=dept.id"
 
-;; (select expr rel1 .. relN) is a short-hand for (select (project expr rel1 .. relN))
+;; (select expr rel1 .. relN) is a short-hand for (select (collect expr rel1 .. relN))
 ;;
 ;; expr can be a vector and the resulting sequence is then made of vectors
 ^:nd => (select [(:name dept) (:name employee)]
@@ -90,12 +90,12 @@
  {:dept "Sales", :employees #{"Jane Doe" "John Doe"}})
 
 ;; and the SQL for this was:
-^:eg => (sql (project {:dept (:name dept) 
+^:eg => (sql (collect {:dept (:name dept) 
                   :employees (many (:name employee))}
           (eq (:dept-id employee) (:id dept))))
 "SELECT dept.name, employee.name FROM dept dept, employee employee WHERE employee.dept_id=dept.id ORDER BY dept.name"
 
-;; aggregation with nested projected rel
+;; aggregation with nested collected rel
 ^:nd => (select {:dept (:name dept) 
                  :employees (many (employee [:name :id]))}
           (eq (:dept-id employee) (:id dept)))
@@ -103,13 +103,11 @@
   {:dept "Sales", :employees #{["Jane Doe" 2] ["John Doe" 1]}})
 
 ;; nested aggregations
-^:nd => (let [employee2 (table "employee" :as (gensym))
-              colleague-name (get (eq (:dept-id employee) (:dept-id employee2))
-                                (:name employee2))]
+^:nd => (let [colleague (another employee)]
           (select {:dept (:name dept) 
-                 :employees (many {:name (employee :name)
-                                   :colleagues (many colleague-name)})}
-          (eq (:dept-id employee) (:id dept))))
+                   :employees (many {:name (:name employee)
+                                     :colleagues (many (:name colleague))})}
+            (eq (:dept-id employee) (:id dept) (:dept-id colleague))))
 ({:dept "Maintenance", 
   :employees #{{:name "Homer Simpson", :colleagues #{"Homer Simpson"}}}}
  {:dept "Sales", 
@@ -133,29 +131,23 @@
 
 ; Removing the employee itself from the colleagues set turns out to be trickier.
 ; Homer Simpson is removed because he doesn't have colleagues.
-^:nd => (let [{:keys [name id dept-id]} (table "employee" :as (gensym))
-              colleague-name (get (rel 
-                                    (eq (:dept-id employee) dept-id)
-                                    (neq (:id employee) id))
-                                name)]
+^:nd => (let [colleague (another employee)]
           (select {:dept (:name dept) 
-                   :employees (many {:name (employee :name)
-                                     :colleagues (many colleague-name)})}
-            (eq (:dept-id employee) (:id dept))))
+                   :employees (many {:name (:name employee)
+                                     :colleagues (many (:name colleague))})}
+            (eq (:dept-id employee) (:id dept) (:dept-id colleague))
+            (neq (:id employee) (:id colleague))))
 ({:dept "Sales", 
   :employees #{{:name "Jane Doe", :colleagues #{"John Doe"}}
                {:name "John Doe", :colleagues #{"Jane Doe"}}}})
 
 ; we need an outer join for this
-^:nd => (let [{:keys [name id dept-id]} (maybe (table "employee" :as (gensym)))
-              colleague-name (get (rel 
-                                    (eq (:dept-id employee) dept-id)
-                                    (neq (:id employee) id))
-                                name)]
+^:nd => (let [colleague (maybe (another employee))]
           (select {:dept (:name dept) 
-                   :employees (many {:name (employee :name)
-                                     :colleagues (many colleague-name)})}
-            (eq (:dept-id employee) (:id dept))))
+                   :employees (many {:name (:name employee)
+                                     :colleagues (many (:name colleague))})}
+            (eq (:dept-id employee) (:id dept) (:dept-id colleague))
+            (neq (:id employee) (:id colleague))))
 ({:dept "Maintenance", 
   :employees #{{:name "Homer Simpson", :colleagues #{}}}}
  {:dept "Sales", 
